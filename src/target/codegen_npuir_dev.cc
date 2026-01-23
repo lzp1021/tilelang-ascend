@@ -1526,13 +1526,34 @@ void CodeGenTileLangNPUIRDEV::VreduceCodegen(const CallNode *op) {
   tvm::tl::NpuirReduce npuirop(op->args, this->vmap);
   Value src = GetVarValue(npuirop.src);
   Value dst = GetVarValue(npuirop.dst);
+  SmallVector<OpFoldResult> offsets, sizes, strides;
+  for (const auto& r : npuirop.src_range) {
+      if (auto* i = as_const_int(r->min)) {
+        offsets.push_back(builder.getI64IntegerAttr(*i));
+      } else {
+        offsets.push_back(CreateIndexCastOp(MakeValue(r->min)));
+      }
+      if (auto* i = as_const_int(r->extent)) {
+        sizes.push_back(builder.getI64IntegerAttr(*i));
+      } else {
+        sizes.push_back(CreateIndexCastOp(MakeValue(r->extent)));
+      }
+      strides.push_back(builder.getI64IntegerAttr(1));
+  }
+  Value sliced_src = builder.create<mlir::tensor::ExtractSliceOp>(
+      builder.getUnknownLoc(),
+      src,
+      offsets,
+      sizes,
+      strides
+  );
   auto reduce_mode = npuirop.reduce_mode;
   mlir::hivm::ReduceOpAttr mode =
       mlir::hivm::ReduceOpAttr::get(&context, NPUIR_STR_REDUCEOP[reduce_mode]);
   mlir::Type dst_type = dst.getType();
   mlir::TypeRange result_tensors(&dst_type, 1);
   auto reduceOp = builder.create<mlir::hivm::VReduceOp>(
-      builder.getUnknownLoc(), result_tensors, src, dst, mode,
+      builder.getUnknownLoc(), result_tensors, sliced_src, dst, mode,
       builder.getDenseI64ArrayAttr(npuirop.reduce_dims));
   SetVarValue(npuirop.dst, reduceOp->getResult(0));
 }
@@ -1822,6 +1843,38 @@ void CodeGenTileLangNPUIRDEV::DotCodegen(const CallNode *op) {
   SetVarValue(npuirop.dst, newMmadL1OpValue);
 }
 
+mlir::Value CodeGenTileLangNPUIRDEV::GenMemrefLoadFromRegion(const BufferLoadNode *op) {
+  auto buffer = op->buffer;
+  auto indices = op->indices;
+
+  // Check pre-conditions
+  if (op->dtype.lanes() != 1) {
+    LOG(FATAL) << "lanes not one";
+  }
+  if (op->dtype != buffer->dtype) {
+    LOG(FATAL) << "The load type and buffer element type do not match";
+  }
+
+  // Convert buffer from Buffer in TIR 2 memref in MLIR
+  auto mem = GetVarValue(buffer->data.get());
+  if (auto tensor = mem.getType().dyn_cast<TensorType>()) {
+    MemRefType memref_type = MemRefType::get(tensor.getShape(), tensor.getElementType());
+    mem = builder.create<bufferization::ToMemrefOp>(
+      builder.getUnknownLoc(), memref_type, mem
+    );
+  }
+
+  // Convert index from PrimExpr in TIR 2 index type in MLIR
+  SmallVector<mlir::Value> convert_inds;
+  for (auto index : indices) {
+    mlir::Value indexVal = CreateIndexCastOp(MakeValue(index));
+    convert_inds.push_back(indexVal);
+  }
+
+  // Create memef.load op in MLIR
+  return builder.create<mlir::memref::LoadOp>(builder.getUnknownLoc(), mem, convert_inds);
+}
+
 /// Generate hivm.hir.vadd for tl.npuir_add.
 /// Generate hivm.hir.vcmp for tl.npuir_cmp.
 /// Generate hivm.hir.vdiv for tl.npuir_div.
@@ -1839,7 +1892,8 @@ template <typename T>
 void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
   auto processImm = [&](mlir::Value &src, int arg_id,
                         Array<PrimExpr> &buffer_shape) {
-    if (op->args[arg_id].as<IntImm>() || op->args[arg_id].as<FloatImm>()) {
+    if (op->args[arg_id].as<IntImm>() || op->args[arg_id].as<FloatImm>() || 
+        op->args[arg_id].as<tir::VarNode>() || op->args[arg_id].as<tir::BufferLoadNode>()) {
       // Scalar case
       const CallNode *region_node = op->args[1 - arg_id].as<CallNode>();
       const BufferLoadNode *buffer_load_node =
@@ -1853,8 +1907,23 @@ void CodeGenTileLangNPUIRDEV::CreateHIVMBinaryVectorOp(const CallNode *op) {
     } else {
       // Vector case
       const CallNode *region_node = op->args[arg_id].as<CallNode>();
-      buffer_shape = region_node->args[0].as<BufferLoadNode>()->buffer->shape;
-      src = GetVarValue(region_node);
+      auto buffer_node = region_node->args[0].as<BufferLoadNode>();
+      buffer_shape = buffer_node->buffer->shape;
+      bool is_scalar_load = true;
+      for (int i = 0; i < buffer_shape.size(); i++) {
+        const IntImmNode* int_imm = region_node->args[2 + i].as<IntImmNode>();
+        if (!int_imm || int_imm->value != 1) {
+          is_scalar_load = false;
+          break;
+        }
+      }
+      const IntImmNode* int_imm = region_node->args[2].as<IntImmNode>();
+      // If load only one element, do not use memref.subview, use memref.load as a scalar
+      if(is_scalar_load) {
+        src = GenMemrefLoadFromRegion(buffer_node);
+      } else {
+        src = GetVarValue(region_node);
+      }
     }
   };
   // src0 src1
@@ -2496,13 +2565,31 @@ void CodeGenTileLangNPUIRDEV::AddFunctionForCoreType(const GlobalVar &gvar,
   for (auto recastInfo : recastNeedInsert) {
     tir::Var v = f->params[recastInfo.first];
     tir::Var real_v = f->buffer_map[v]->data;
+    Array<PrimExpr> shape = f->buffer_map[v]->shape;
     auto memrefType = llvm::dyn_cast<MemRefType>(recastInfo.second);
     auto strideLayout =
         llvm::dyn_cast<StridedLayoutAttr>(memrefType.getLayout());
+    SmallVector<OpFoldResult> shape_val;
+    for (PrimExpr s : shape) {
+      if (auto s_int = as_const_int(s)) {
+        shape_val.push_back(builder.getI64IntegerAttr(*s_int));
+      } else {
+        mlir::Value s_index = CreateIndexCastOp(MakeValue(s));
+        shape_val.push_back(s_index);
+      }
+    }
+    size_t dim = shape.size();
+    SmallVector<OpFoldResult> stride_val(dim);
+    tvm::PrimExpr tmp_stride = IntImm(shape[0].dtype(), 1);
+    for (int i = dim - 1; i >= 0; i--) {
+      mlir::Value s_index = CreateIndexCastOp(MakeValue(tmp_stride));
+      stride_val[i] = s_index;
+      tmp_stride = Mul(shape[i], tmp_stride);
+    }
+    OpFoldResult offset = builder.getI64IntegerAttr(strideLayout.getOffset());
     auto recastOp = builder.create<memref::ReinterpretCastOp>(
         builder.getUnknownLoc(), memrefType, GetVarValue(real_v.get()),
-        strideLayout.getOffset(), memrefType.getShape(),
-        strideLayout.getStrides());
+        offset, shape_val, stride_val);
     SetVarValue(real_v.get(), recastOp);
   }
   mlir::hacc::KernelArgTypeAttr accArgAttr = hacc::KernelArgTypeAttr::get(
@@ -2721,9 +2808,16 @@ mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const BufferLoadNode *op) {
     convert_inds.push_back(indexVal);
   }
 
-  // Create tensor.extract op in MLIR
-  return builder.create<mlir::tensor::ExtractOp>(builder.getUnknownLoc(), mem,
-                                               convert_inds);
+  if (mem.getType().isa<mlir::MemRefType>()) {
+    // Create a memref.load op for the memref-typed buffer.
+    return builder.create<mlir::memref::LoadOp>(builder.getUnknownLoc(), mem, convert_inds);
+  } else if (mem.getType().isa<mlir::TensorType>()) {
+    // Create a tensor.extract op for the tensor-typed buffer.
+    return builder.create<mlir::tensor::ExtractOp>(builder.getUnknownLoc(), mem, convert_inds);
+  } else {
+    // Throw a fatal error for illegal types
+    LOG(FATAL) << "The buffer type in BufferLoadNode must be one of tensor or memref";
+  }
 }
 
 mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const RampNode *op) {
@@ -2763,9 +2857,19 @@ void CodeGenTileLangNPUIRDEV::VisitStmt_(const BufferStoreNode *op) {
     convert_inds.push_back(indexVal);
   }
 
-  mlir::Value result = builder.create<mlir::tensor::InsertOp>(builder.getUnknownLoc(), mlir_value,
-                                         mem, convert_inds);
-  SetVarValue(buffer, result);
+  if (mem.getType().isa<mlir::MemRefType>()) {
+    // Create a memref.store op for the memref-typed buffer.
+    builder.create<mlir::memref::StoreOp>(builder.getUnknownLoc(), mlir_value,
+                                          mem, convert_inds);
+  } else if (mem.getType().isa<mlir::TensorType>()) {
+    // Create a tensor.insert op for the tensor-typed buffer.
+    mlir::Value result = builder.create<mlir::tensor::InsertOp>(builder.getUnknownLoc(), mlir_value,
+                                                                mem, convert_inds);
+    SetVarValue(buffer, result);
+  } else {
+    // Throw a fatal error for illegal types
+    LOG(FATAL) << "The buffer type in BufferStoreNode must be one of tensor or memref";
+  }
 }
 
 void CodeGenTileLangNPUIRDEV::VisitStmt_(const WhileNode *op) {

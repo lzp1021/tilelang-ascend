@@ -142,16 +142,24 @@ def _symbolic_var_promoter_pass(func: PrimFunc):
 
 
 def _get_npucompiler_path() -> str:
-    # Set the environment variables for the compiler
-    ascend_home = os.environ.get("ASCEND_HOME_PATH")
-    if ascend_home is None:
-        raise Exception("CANN environment not detected (ASCEND_HOME_PATH)")
-    bisheng_install_path = os.environ.get("BISHENG_INSTALL_PATH")
-    if bisheng_install_path is not None:
-        return os.path.join(bisheng_install_path, "bishengir-compile")
-    else:
-        bishengir = os.path.join(ascend_home, "bisheng_toolkit", "bishengir", "bin")
-        return os.path.join(bishengir, "bishengir-compile")
+    # Get bishengir-compile from PATH
+    npu_compiler_path = shutil.which("bishengir-compile")
+    if npu_compiler_path is None:
+        npu_compiler_root = os.getenv("TRITON_NPU_COMPILER_PATH", "")
+        if npu_compiler_root is None:
+            raise EnvironmentError(
+                "Couldn't find executable bishengir-compile or TRITON_NPU_COMPILER_PATH."
+            )
+        npu_compiler_path = os.path.join(npu_compiler_root, "npuc")
+    return npu_compiler_path
+
+def _get_npucompiler_opt_path() -> str:
+    npu_compiler_opt_path = shutil.which("bishengir-opt")
+    if npu_compiler_opt_path is None:
+        raise EnvironmentError(
+            "Couldn't find executable bishengir-opt."
+        )
+    return npu_compiler_opt_path
 
 
 def convert_sigtype_to_int(sigty: str):
@@ -1254,6 +1262,27 @@ class compiler_npu:
             Path(ttadapter_path).write_text(linalg)
             bin_file = os.path.join(tmpdir, "kernel")
             bin_path = os.path.join(tmpdir, "kernel.o")
+            
+            # Hot fix for CANN 8.5
+            # Run --adapt-triton-kernel pass before running compilation pipeline
+            # TODO: temporary fix, will be updated when bishengir-compile
+            # and hivmc gets updated in CANN 8.5
+            npu_compiler_opt_path = _get_npucompiler_opt_path()
+            
+            _opt_option_list = [
+               "--adapt-triton-kernel"
+            ]
+            
+            opt_cmd_list = (
+                [npu_compiler_opt_path, ttadapter_path]
+                + _opt_option_list
+                + ["-o", ttadapter_path]
+            )
+            ret = subprocess.run(
+                opt_cmd_list, capture_output=True, check=True, text=True
+            )
+            print("AscendNPU IR OPT success:", ret.stdout)
+            # Hot fix for CANN 8.5 ends here
 
             npu_compiler_path = _get_npucompiler_path()
             # TileLang Ascend JIT Runtime now follows Triton JIT style.
